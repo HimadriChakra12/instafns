@@ -2627,7 +2627,7 @@ var XMLHttpRequest = wrapCtorForPatching(window.XMLHttpRequest), WebSocket = wra
   if (window.__instafnVoiceSnifferInstalled) return;
   window.__instafnVoiceSnifferInstalled = true;
 
-  var DEBUG = false; // flip on to trace capture in the console
+  var DEBUG = true; // temporarily on -- flip back to false once voice download is confirmed working
 
   // attachment_fbid then (within the same flat attachment object — the waveform
   // is a bare number array, no braces) the cdn url. URLs never contain a
@@ -11878,8 +11878,19 @@ let listenerInstalled = false;
 function ensureVoiceListener() {
   if (listenerInstalled) return;
   listenerInstalled = true;
-  window.addEventListener("message", (e) => {
-    if (e.source !== window) return;
+  // Userscript-shim note: bare `window` here is NOT guaranteed to be the
+  // real page window -- Tampermonkey/Violentmonkey run userscripts in a
+  // sandbox, and depending on manager/browser/injection mode, unqualified
+  // `window` inside a userscript can be a distinct sandbox object from the
+  // real page's window (that's exactly why the shim exposes __realWindow /
+  // unsafeWindow elsewhere). voice-sniffer.js posts via the real page
+  // window explicitly; listening and comparing against the ambiguous bare
+  // `window` here risked silently never matching, dropping every captured
+  // voice-clip pair. __realWindow is declared once in shim/02-page-inject.js
+  // and is in scope here since this module runs inside that same bundle.
+  var relayWindow = (typeof __realWindow !== "undefined") ? __realWindow : window;
+  relayWindow.addEventListener("message", (e) => {
+    if (e.source !== relayWindow) return;
     const d = e.data;
     if (!d || d.source !== "instafn-voice-dl" || !Array.isArray(d.pairs)) return;
     for (const p of d.pairs) {

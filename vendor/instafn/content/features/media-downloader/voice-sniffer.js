@@ -25,7 +25,7 @@
   if (window.__instafnVoiceSnifferInstalled) return;
   window.__instafnVoiceSnifferInstalled = true;
 
-  var DEBUG = false; // flip on to trace capture in the console
+  var DEBUG = true; // temporarily on -- flip back to false once voice download is confirmed working
 
   // attachment_fbid then (within the same flat attachment object — the waveform
   // is a bare number array, no braces) the cdn url. URLs never contain a
