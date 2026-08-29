@@ -3,7 +3,6 @@ features/profile-pic-popup/index.js
 features/tab-disabler/index.js
 features/changelog/index.js
 features/changelog/changelog.js
-features/action-interceptors/index.js
 features/video-scrubber/videoScrubber.js
 features/hide-suggested/index.js
 features/search-cleaner/index.js

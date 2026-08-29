@@ -1,17 +1,4 @@
 import {
-  interceptStoryQuickReactions,
-  interceptStoryReplies,
-  interceptLikes,
-  interceptComments,
-  interceptCalls,
-  interceptFollows,
-  interceptReposts,
-  forceHoverOnElement,
-  keepElementClicked,
-  releaseElementClick,
-} from "./features/action-interceptors/index.js";
-
-import {
   scanFollowersAndFollowing,
   fetchUserInfo,
   injectScanButton,
@@ -116,13 +103,6 @@ document.addEventListener("DOMContentLoaded", () => {
     {
       blockStorySeen: false,
       enableManualMarkAsSeen: false,
-      confirmLike: false,
-      confirmComment: false,
-      confirmCall: false,
-      confirmFollow: false,
-      confirmReposts: false,
-      confirmStoryQuickReactions: false,
-      confirmStoryReplies: false,
       activateFollowAnalyzer: false,
       enableVideoScrubber: false,
       enableReelSpeedHold: true,
@@ -153,13 +133,6 @@ document.addEventListener("DOMContentLoaded", () => {
       ...DOWNLOAD_DEFAULTS,
     },
     (settings) => {
-      if (settings.confirmLike) interceptLikes();
-      if (settings.confirmComment) interceptComments();
-      if (settings.confirmCall) interceptCalls();
-      if (settings.confirmFollow) interceptFollows();
-      if (settings.confirmReposts) interceptReposts();
-      if (settings.confirmStoryQuickReactions) interceptStoryQuickReactions();
-      if (settings.confirmStoryReplies) interceptStoryReplies();
       if (settings.blockTypingReceipts) initTypingReceiptBlocker(true);
       if (settings.enableManualMarkAsSeen) initManualStorySeenButton(true);
 
@@ -636,7 +609,4 @@ Object.assign(window.Instafn, {
   renderScanButton,
   confirmWithModal,
   enableDMDebug, // Debug function for DM popup hider
-  forceHover: forceHoverOnElement, // Force hover on element
-  keepClicked: keepElementClicked, // Keep element in clicked state
-  releaseClick: releaseElementClick, // Release clicked element
 });
