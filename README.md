@@ -1,66 +1,113 @@
-<div align="center">
-  <img src="src/icons/icon.png" alt="Instafn Logo" width="128" height="128">
-  
-  # Instafn
-  
-  **Extend your Instagram web experience with powerful privacy and productivity features**
-  
-  [![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=google-chrome)](https://chromewebstore.google.com/detail/instafn/jiibmffeclebkgoemoooehhmkopmlenf)
-</div>
+# Instafn (userscript build)
 
-https://github.com/user-attachments/assets/aad3b2a1-44f6-48e0-9822-fab92b2dc57d
+A userscript port of [instafn](https://github.com/xafn/instafn), an
+Instagram web mod. Built with a small MuJS-hosted compiler instead of
+npm/vite -- see "How it's built" below. Works in both Tampermonkey and
+Violentmonkey, on both Chrome and Firefox.
 
-## 🔍 How it works
+## Install
 
-Instafn is a browser extension that modifies the Instagram website to improve your experience. It injects modifications and intercepts data sent from the Instagram server. Toggle features on and off in the settings according to your liking.
+1. Build it (see below), or grab `dist/instafn.user.js` if it's already built.
+2. Open it in a browser with Tampermonkey/Violentmonkey installed, or drag
+   it onto the extension's dashboard. Confirm the install prompt.
+3. Visit instagram.com. A small gear button appears bottom-right -- click it
+   (or use the manager's menu -> "Instafn settings") for the settings page.
 
-## ⚙️ Features
+## Build
 
-### 👤 Profile Features
-- **Follow Status Indicator**: Displays whether a user follows you on their profile page.
-- **Profile Comments**: Adds a comment section to profile pages (visible to other extension users).
-- **Profile Picture Popup**: Long press a profile picture to see an enlarged view.
-- **Highlight Popup**: Long press a highlight to see an enlarged view.
-- **Follow Analyzer**: Analyze followers and following lists to track unfollows and users who don't follow back.
+```sh
+apt install libmujs-dev    # or build mujs from source, see Makefile
+make
+```
 
-### ☑️ Action Confirmations
-Prevent accidental actions by requiring confirmation for:
-- Likes
-- Comments
-- Calls
-- Follows
-- Reposts
-- Story Quick Reactions
-- Story Replies
+Produces `dist/instafn.user.js`. `make rebuild` re-runs the transform
+without recompiling the C build tool; `make clean` removes both.
 
-### 🔒 Privacy & Receipts
-- **Block Story Seen Receipts**: Prevents automatically marking stories as seen when you view them.
-- **Manual Mark as Seen Button**: Adds a button to manually mark stories as seen.
-- **Block Typing Receipts**: Blocks typing receipts from being sent in messages.
+## Layout
 
-### 🎥 Video & Media
-- **Universal Video Scrubber**: Adds video controls (scrubber, time, duration) to all videos including reels, stories, and feed posts.
+```
+tools/build.c        MuJS host: readFile/writeFile/exists/log for
+                      transform.js, plus the plain-C parts (directory walk,
+                      userscript @grant/@match/header block) -- adapted from
+                      avroc.c (Avroscript) + bundlejs's build.c/build.h split.
+tools/build.h         The C-side helpers (file IO, dir walk, header emission).
+tools/transform.js    Runs under MuJS. Strips ES module import/export from
+                      the vendored source and rewraps each file as a
+                      CommonJS-lite module; also builds the settings-page
+                      assets (see below).
+src/shim/             Hand-written glue -- everything the extension had that
+                      a userscript can't (chrome.storage, background
+                      service worker, popup/settings pages).
+vendor/instafn/       Unmodified copy of upstream's src/content/ and
+                      src/settings/. To pick up an upstream update: replace
+                      this directory with the new copy and `make rebuild`.
+dist/instafn.user.js  Build output.
+```
 
-### 💬 Messages
-- **Double-Tap to Like**: Double tap a message to like it.
-- **Quick Reply**: Shortcut (Ctrl/Cmd + Up) to reply to the last message.
-- **Quick Edit**: Shortcut (Ctrl/Cmd + Shift + Up) to edit your last message.
-- **Message Logger**: Logs deleted messages locally so you can still read them.
+## What changed vs. the extension, and why
 
-### 🖱️ Navigation
-- Hide Recent Searches
-- Disable specific tabs: Search, Explore, Reels, Messages, Notifications, Create, Also from Meta.
+Everything below is a shim living in `src/shim/` -- **the vendored feature
+code itself is untouched**, byte-for-byte from upstream. `chrome`, `fetch`,
+etc. are just local variables inside the bundle's closure that happen to
+shadow what the vendored files already call.
 
-### 🖥️ Display
-- **Call Timer**: Shows elapsed time during calls.
-- **Exact Time**: Replaces relative dates with exact timestamps in your preferred format.
+- **`chrome.storage.sync/local`** -> `GM_getValue`/`GM_setValue`, with a
+  synthesized `chrome.storage.onChanged` so existing listeners still fire.
+- **Downloads** (background service worker -> `chrome.downloads`) ->
+  `GM_download`. Cross-origin CDN fetches (cdninstagram.com/fbcdn.net,
+  previously CORS-free via `host_permissions`) -> a local `fetch()` shadow
+  that routes just those hosts through `GM_xmlhttpRequest`; everything else
+  (instagram.com itself) still uses the real `fetch`, cookies included.
+- **Page-context script injection** (`<script src=chrome-extension://...>`,
+  needed to escape the isolated content-script world and patch the *page's*
+  WebSocket/fetch) -> called directly against `unsafeWindow`. No script tag
+  means Instagram's CSP never enters into it.
+  - On Firefox, a sandbox function assigned directly onto `unsafeWindow`
+    isn't reliably usable by the page as a constructor (`new`/`instanceof`
+    across the Xray boundary). A small `Proxy` in front of `unsafeWindow`
+    runs every function-valued `window.X = ...` these scripts do through
+    `exportFunction` automatically when it's available (Firefox only --
+    it's a no-op passthrough on Chrome). Nothing in the vendored scripts
+    needed to change for this.
+- **Popup + settings.html** -> the *actual* vendored `settings.html` /
+  `settings.css` / `settings.js` / `settings-shared.js` / `toast.js`,
+  mounted as a full-viewport overlay inside the current Instagram tab
+  (`#instafn-settings-root`) instead of a separate extension page. This
+  keeps GM_* storage access working (a genuinely separate tab would need
+  the userscript manager's `@match` to cover whatever URL it opened, which
+  is unreliable for `data:`/`blob:` URLs across managers) and means
+  "reload the Instagram tab after saving" is just `location.reload()`.
+  `settings.css` is scoped under `#instafn-settings-root` at build time
+  (see `scopeCss` in transform.js) so it can't leak onto the rest of the
+  page. **Removed**: the "are you sure?" confirmation prompts before
+  enabling Typing Receipt Blocking / Native DM Themes / Follow Analyzer
+  (`CONFIRM_ON_ENABLE` in `settings-shared.js`) -- emptied at build time,
+  a product decision rather than a technical shim.
+- **`chrome.tabs.query/reload/create`** (used only by the settings page, to
+  reload "the Instagram tab" after saving) -> `location.reload()` /
+  `window.open()`, since the settings UI now lives in that same tab.
+- **`chrome.runtime.getManifest().version`** -> `GM_info.script.version`.
 
-## 🐛 Bugs and Features
-If you see a bug or want to request a new feature please open an issue under this repository.
+## Testing
 
-## 🧑‍💻 Development
+`test/smoke.js` boots the built bundle in jsdom with stubbed `GM_*`/
+`unsafeWindow` (and, in a second pass, stubbed `exportFunction`/`cloneInto`
+to exercise the Firefox code path) and exercises the settings overlay end
+to end: mount, splash -> continue, toggle flip, nested enable/disable, and
+confirms no confirmation dialog fires anymore. It is **not** a substitute
+for testing against real Instagram DOM -- that needs a real browser and a
+real page.
 
-1. Clone the repository.
-2. Run `npm install` to install dependencies.
-3. Run `npm run build` to build the extension.
-4. Load the `dist` directory as an unpacked extension in your browser.
+## Known limitations
+
+- Feature-level behavior (follow analyzer, media downloader, message
+  logger, etc.) is verified to *load* without errors, not verified against
+  live Instagram markup -- that vendored code is completely unmodified from
+  upstream, so it should behave identically, but hasn't been exercised
+  end-to-end outside of the extension.
+- `exportFunction`/`cloneInto` handling covers direct `window.X = fn`
+  assignments (WebSocket, fetch) in the 5 page-context scripts. A function
+  nested inside an assigned object (e.g. a method added later onto
+  `window.InstafnStory`) isn't separately exported; low risk since nothing
+  in the vendored code has Instagram's own page scripts calling into that
+  object directly.
