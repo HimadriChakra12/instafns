@@ -283,10 +283,16 @@ function fetch(url, opts) {
 // nothing for Instagram's CSP to block, because we never ask the page to
 // parse or fetch anything. So instead of injecting a URL, we just call the
 // vendored IIFE body directly, with its `window` parameter bound to
-// unsafeWindow. The vendored source for these files is completely
-// unmodified (see PAGE_SCRIPTS_LIST / toPageScript in transform.js) -- every
-// `window.WebSocket = ...` inside them already does exactly the right thing
-// once `window` here means the real page window.
+// unsafeWindow. The vendored source for these files is untouched (see
+// PAGE_SCRIPTS_LIST in transform.js) -- every `window.WebSocket = ...`
+// inside them already does exactly the right thing once `window` here means
+// the real page window. The one thing that ISN'T untouched is bare global
+// references these scripts make (`XMLHttpRequest.prototype.open = ...`,
+// not `window.XMLHttpRequest...`) -- toPageScript() in transform.js shadows
+// those identifiers with locals bound to the real window before the
+// vendored src runs, since an unqualified `XMLHttpRequest`/`WebSocket`
+// would otherwise resolve to the userscript sandbox's own constructor
+// instead of the page's.
 // ---------------------------------------------------------------------
 
 var __realWindow = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
@@ -369,6 +375,76 @@ function runPageScript(key) {
         console.error("[Instafn] error running page script", key, err);
         return false;
     }
+}
+
+// ---- Xray-safe constructor wrapping (Firefox only) -----------------------
+//
+// makePageWindowProxy's `set` trap only fires for assignments made directly
+// on the `window` object it wraps (`window.fetch = ...`). It does NOT fire
+// for `XMLHttpRequest.prototype.open = ...` or `SomeCtor.prototype.x = fn`
+// -- that's a property set on a *different* object (the constructor's
+// prototype), two property-accesses removed from `window`, which no Proxy
+// on `window` alone can see. On Chrome this is harmless (unsafeWindow is
+// the real page window, so `window.XMLHttpRequest.prototype` already *is*
+// the real prototype and a plain assignment just works). On Firefox,
+// `window.XMLHttpRequest.prototype` is a real page-compartment object
+// viewed through an Xray wrapper; assigning a sandbox-created function onto
+// it as a method skips exportFunction, so the resulting property is not a
+// callable a page-compartment caller can invoke correctly -- Instagram's
+// own `xhr.open(...)` call silently no-ops instead of running our patch,
+// which is exactly what broke DM voice-note capture (the thread loads over
+// XHR, not fetch) despite XMLHttpRequest itself now correctly pointing at
+// the real page constructor.
+//
+// wrapCtorForPatching(ctor) returns a stand-in for the constructor whose
+// `.prototype` is a Proxy: any function assigned onto it gets run through
+// exportFunction first. On Chrome (no exportFunction/cloneInto) this is a
+// no-op passthrough, same as makePageWindowProxy above.
+var __wrappedCtors = (typeof WeakMap !== "undefined") ? new WeakMap() : null;
+
+function wrapCtorForPatching(realCtor) {
+    if (typeof exportFunction !== "function" || typeof cloneInto !== "function") {
+        return realCtor; // Chrome/Edge/etc -- direct assignment already works.
+    }
+    if (!realCtor || typeof realCtor !== "function") return realCtor;
+    if (__wrappedCtors && __wrappedCtors.has(realCtor)) return __wrappedCtors.get(realCtor);
+
+    var protoProxy = new Proxy(realCtor.prototype, {
+        get: function (t, prop) { return Reflect.get(t, prop, t); },
+        set: function (t, prop, value) {
+            if (typeof value === "function") {
+                try {
+                    value = exportFunction(value, __realWindow, { defineAs: typeof prop === "string" ? prop : undefined });
+                } catch (e) {
+                    console.error("[Instafn] exportFunction failed for prototype." + String(prop), e);
+                }
+            }
+            return Reflect.set(t, prop, value);
+        }
+    });
+
+    // The Proxy target here is a throwaway plain function, NOT realCtor
+    // itself -- a native constructor's own .prototype descriptor is
+    // {writable:false, configurable:false}, and returning a different
+    // object for it from a `get` trap on a Proxy targeting realCtor
+    // directly violates the Proxy invariant for non-configurable,
+    // non-writable properties (throws a TypeError the moment anything
+    // reads `.prototype`). A fresh function's own .prototype is writable/
+    // configurable by default, so the same substitution is legal there.
+    var dummyTarget = function () {};
+    var shim = new Proxy(dummyTarget, {
+        get: function (t, prop) {
+            if (prop === "prototype") return protoProxy;
+            var v = Reflect.get(realCtor, prop, realCtor);
+            return (typeof v === "function") ? v.bind(realCtor) : v;
+        },
+        construct: function (t, args, newTarget) {
+            return Reflect.construct(realCtor, args, newTarget === shim ? realCtor : newTarget);
+        },
+        has: function (t, prop) { return prop in realCtor; }
+    });
+    if (__wrappedCtors) __wrappedCtors.set(realCtor, shim);
+    return shim;
 }
 
 // ---- replacement for vendor's utils/scriptInjector.js -----------------
@@ -1449,6 +1525,12 @@ document.addEventListener("DOMContentLoaded", () => {
 // ---------------------------------------------------------------------
 
 var __settingsPageMounted = false;
+var __settingsEscListenerInstalled = false;
+
+function closeSettingsPage() {
+    var existing = document.getElementById(SETTINGS_ROOT_ID);
+    if (existing) existing.style.display = "none";
+}
 
 function openSettingsPage() {
     var existing = document.getElementById(SETTINGS_ROOT_ID);
@@ -1458,9 +1540,26 @@ function openSettingsPage() {
     }
 
     if (typeof GM_addStyle === "function") {
+        // SETTINGS_PAGE_CSS (scoped from the vendored settings.css) sets its
+        // own `position: relative` on #SETTINGS_ROOT_ID -- that's the rule
+        // that used to come from the standalone extension page's <body>.
+        // Since it has the same specificity as the overlay rule below, CSS
+        // source order decides the winner: putting SETTINGS_PAGE_CSS *first*
+        // and the overlay rule *after* it means our fixed/inset positioning
+        // wins, instead of silently losing to `position: relative` and
+        // leaving the settings page laid out inline in Instagram's own
+        // document flow (which is what was causing the page-scroll mess
+        // instead of a proper overlay).
         GM_addStyle(
-            "#" + SETTINGS_ROOT_ID + " { position: fixed; inset: 0; z-index: 2147483647; overflow: auto; }\n" +
-            SETTINGS_PAGE_CSS
+            SETTINGS_PAGE_CSS + "\n" +
+            "#" + SETTINGS_ROOT_ID + " { position: fixed !important; inset: 0 !important; z-index: 2147483647; overflow: auto; }\n" +
+            // The vendored header (<header><h1>Instafn</h1></header>) has no
+            // close affordance -- it never needed one as a standalone
+            // extension page (you'd just close the tab). #instafn-settings-close
+            // is appended into that header below; this styles+positions it.
+            "#instafn-settings-close { position: absolute; top: 16px; right: 20px; width: 32px; height: 32px; border-radius: 50%; border: none; background: transparent; color: rgb(var(--ig-primary-text)); font-size: 20px; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; }\n" +
+            "#instafn-settings-close:hover { background: rgb(var(--ig-highlight-background)); }\n" +
+            "#" + SETTINGS_ROOT_ID + " header { position: relative; }"
         );
     }
 
@@ -1468,6 +1567,30 @@ function openSettingsPage() {
     root.id = SETTINGS_ROOT_ID;
     root.innerHTML = SETTINGS_PAGE_HTML;
     (document.body || document.documentElement).appendChild(root);
+
+    // Cross/close button -- the vendored header has none (a standalone
+    // extension page just gets closed as a tab; there's no "tab" here).
+    // Appended into <header>, which the CSS above makes a positioned
+    // ancestor so this lands top-right of it instead of the whole overlay.
+    var header = root.querySelector("header");
+    if (header && !header.querySelector("#instafn-settings-close")) {
+        var closeBtn = document.createElement("button");
+        closeBtn.id = "instafn-settings-close";
+        closeBtn.title = "Close settings";
+        closeBtn.setAttribute("aria-label", "Close settings");
+        closeBtn.textContent = "\u2715";
+        closeBtn.onclick = closeSettingsPage;
+        header.appendChild(closeBtn);
+    }
+
+    if (!__settingsEscListenerInstalled) {
+        __settingsEscListenerInstalled = true;
+        document.addEventListener("keydown", function (e) {
+            if (e.key !== "Escape") return;
+            var el = document.getElementById(SETTINGS_ROOT_ID);
+            if (el && el.style.display !== "none") closeSettingsPage();
+        });
+    }
 
     if (!__settingsPageMounted) {
         // toast.js / settings-shared.js / settings.js all run once, here --
@@ -1481,27 +1604,12 @@ function openSettingsPage() {
 }
 
 function initSettingsPageEntryPoints() {
+    // The only entry point now is the userscript-manager's menu command
+    // (Tampermonkey/Violentmonkey extension icon -> "Instafn settings").
+    // The on-page floating settings button was removed since that's
+    // redundant with the extension's own menu.
     if (typeof GM_registerMenuCommand === "function") {
         GM_registerMenuCommand("Instafn settings", openSettingsPage);
-    }
-
-    function addFab() {
-        if (document.getElementById("instafn-settings-fab")) return;
-        if (typeof GM_addStyle === "function" && !addFab._styled) {
-            GM_addStyle("#instafn-settings-fab { position: fixed; bottom: 20px; right: 20px; z-index: 999999; width: 44px; height: 44px; border-radius: 50%; background: #262626; color: #fff; border: none; font-size: 18px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.3); }");
-            addFab._styled = true;
-        }
-        var fab = document.createElement("button");
-        fab.id = "instafn-settings-fab";
-        fab.textContent = "\u2699";
-        fab.title = "Instafn settings";
-        fab.onclick = openSettingsPage;
-        (document.body || document.documentElement).appendChild(fab);
-    }
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", addFab, { once: true });
-    } else {
-        addFab();
     }
 }
 
@@ -1538,6 +1646,7 @@ STYLE_SOURCES["features/profile-pic-popup/profilePicPopup.css"] = ".instafn-pfp-
 // ---- page-context scripts (run against unsafeWindow) ----
 
 PAGE_SCRIPTS["features/message-logger/socket-sniffer.js"] = function (window) {
+var XMLHttpRequest = wrapCtorForPatching(window.XMLHttpRequest), WebSocket = wrapCtorForPatching(window.WebSocket);
 /**
  * WebSocket Sniffer - Injected into page context
  * This intercepts all WebSocket messages and relays them to the content script
@@ -1874,6 +1983,7 @@ PAGE_SCRIPTS["features/message-logger/socket-sniffer.js"] = function (window) {
 
 
 PAGE_SCRIPTS["features/message-logger/graphql-sniffer.js"] = function (window) {
+var XMLHttpRequest = wrapCtorForPatching(window.XMLHttpRequest), WebSocket = wrapCtorForPatching(window.WebSocket);
 /**
  * GraphQL Sniffer - Injected into page context
  * This intercepts GraphQL requests and relays responses to the content script
@@ -2157,6 +2267,7 @@ PAGE_SCRIPTS["features/message-logger/graphql-sniffer.js"] = function (window) {
 
 
 PAGE_SCRIPTS["features/story-blocking/storyblocking.js"] = function (window) {
+var XMLHttpRequest = wrapCtorForPatching(window.XMLHttpRequest), WebSocket = wrapCtorForPatching(window.WebSocket);
 (function() {
   "use strict";
 
@@ -2495,6 +2606,7 @@ PAGE_SCRIPTS["features/story-blocking/storyblocking.js"] = function (window) {
 
 
 PAGE_SCRIPTS["features/media-downloader/voice-sniffer.js"] = function (window) {
+var XMLHttpRequest = wrapCtorForPatching(window.XMLHttpRequest), WebSocket = wrapCtorForPatching(window.WebSocket);
 /**
  * Voice-message URL sniffer — injected into the page (MAIN world).
  *
@@ -2655,6 +2767,7 @@ PAGE_SCRIPTS["features/media-downloader/voice-sniffer.js"] = function (window) {
 
 
 PAGE_SCRIPTS["features/typing-receipt-blocker/websocket-interceptor.js"] = function (window) {
+var XMLHttpRequest = wrapCtorForPatching(window.XMLHttpRequest), WebSocket = wrapCtorForPatching(window.WebSocket);
 /**
  * WebSocket Interceptor for Typing Receipt Blocking
  * Injected into page context to intercept and modify WebSocket messages

@@ -15,10 +15,16 @@
 // nothing for Instagram's CSP to block, because we never ask the page to
 // parse or fetch anything. So instead of injecting a URL, we just call the
 // vendored IIFE body directly, with its `window` parameter bound to
-// unsafeWindow. The vendored source for these files is completely
-// unmodified (see PAGE_SCRIPTS_LIST / toPageScript in transform.js) -- every
-// `window.WebSocket = ...` inside them already does exactly the right thing
-// once `window` here means the real page window.
+// unsafeWindow. The vendored source for these files is untouched (see
+// PAGE_SCRIPTS_LIST in transform.js) -- every `window.WebSocket = ...`
+// inside them already does exactly the right thing once `window` here means
+// the real page window. The one thing that ISN'T untouched is bare global
+// references these scripts make (`XMLHttpRequest.prototype.open = ...`,
+// not `window.XMLHttpRequest...`) -- toPageScript() in transform.js shadows
+// those identifiers with locals bound to the real window before the
+// vendored src runs, since an unqualified `XMLHttpRequest`/`WebSocket`
+// would otherwise resolve to the userscript sandbox's own constructor
+// instead of the page's.
 // ---------------------------------------------------------------------
 
 var __realWindow = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
@@ -101,6 +107,76 @@ function runPageScript(key) {
         console.error("[Instafn] error running page script", key, err);
         return false;
     }
+}
+
+// ---- Xray-safe constructor wrapping (Firefox only) -----------------------
+//
+// makePageWindowProxy's `set` trap only fires for assignments made directly
+// on the `window` object it wraps (`window.fetch = ...`). It does NOT fire
+// for `XMLHttpRequest.prototype.open = ...` or `SomeCtor.prototype.x = fn`
+// -- that's a property set on a *different* object (the constructor's
+// prototype), two property-accesses removed from `window`, which no Proxy
+// on `window` alone can see. On Chrome this is harmless (unsafeWindow is
+// the real page window, so `window.XMLHttpRequest.prototype` already *is*
+// the real prototype and a plain assignment just works). On Firefox,
+// `window.XMLHttpRequest.prototype` is a real page-compartment object
+// viewed through an Xray wrapper; assigning a sandbox-created function onto
+// it as a method skips exportFunction, so the resulting property is not a
+// callable a page-compartment caller can invoke correctly -- Instagram's
+// own `xhr.open(...)` call silently no-ops instead of running our patch,
+// which is exactly what broke DM voice-note capture (the thread loads over
+// XHR, not fetch) despite XMLHttpRequest itself now correctly pointing at
+// the real page constructor.
+//
+// wrapCtorForPatching(ctor) returns a stand-in for the constructor whose
+// `.prototype` is a Proxy: any function assigned onto it gets run through
+// exportFunction first. On Chrome (no exportFunction/cloneInto) this is a
+// no-op passthrough, same as makePageWindowProxy above.
+var __wrappedCtors = (typeof WeakMap !== "undefined") ? new WeakMap() : null;
+
+function wrapCtorForPatching(realCtor) {
+    if (typeof exportFunction !== "function" || typeof cloneInto !== "function") {
+        return realCtor; // Chrome/Edge/etc -- direct assignment already works.
+    }
+    if (!realCtor || typeof realCtor !== "function") return realCtor;
+    if (__wrappedCtors && __wrappedCtors.has(realCtor)) return __wrappedCtors.get(realCtor);
+
+    var protoProxy = new Proxy(realCtor.prototype, {
+        get: function (t, prop) { return Reflect.get(t, prop, t); },
+        set: function (t, prop, value) {
+            if (typeof value === "function") {
+                try {
+                    value = exportFunction(value, __realWindow, { defineAs: typeof prop === "string" ? prop : undefined });
+                } catch (e) {
+                    console.error("[Instafn] exportFunction failed for prototype." + String(prop), e);
+                }
+            }
+            return Reflect.set(t, prop, value);
+        }
+    });
+
+    // The Proxy target here is a throwaway plain function, NOT realCtor
+    // itself -- a native constructor's own .prototype descriptor is
+    // {writable:false, configurable:false}, and returning a different
+    // object for it from a `get` trap on a Proxy targeting realCtor
+    // directly violates the Proxy invariant for non-configurable,
+    // non-writable properties (throws a TypeError the moment anything
+    // reads `.prototype`). A fresh function's own .prototype is writable/
+    // configurable by default, so the same substitution is legal there.
+    var dummyTarget = function () {};
+    var shim = new Proxy(dummyTarget, {
+        get: function (t, prop) {
+            if (prop === "prototype") return protoProxy;
+            var v = Reflect.get(realCtor, prop, realCtor);
+            return (typeof v === "function") ? v.bind(realCtor) : v;
+        },
+        construct: function (t, args, newTarget) {
+            return Reflect.construct(realCtor, args, newTarget === shim ? realCtor : newTarget);
+        },
+        has: function (t, prop) { return prop in realCtor; }
+    });
+    if (__wrappedCtors) __wrappedCtors.set(realCtor, shim);
+    return shim;
 }
 
 // ---- replacement for vendor's utils/scriptInjector.js -----------------

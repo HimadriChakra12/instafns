@@ -19,6 +19,12 @@
 // ---------------------------------------------------------------------
 
 var __settingsPageMounted = false;
+var __settingsEscListenerInstalled = false;
+
+function closeSettingsPage() {
+    var existing = document.getElementById(SETTINGS_ROOT_ID);
+    if (existing) existing.style.display = "none";
+}
 
 function openSettingsPage() {
     var existing = document.getElementById(SETTINGS_ROOT_ID);
@@ -28,9 +34,26 @@ function openSettingsPage() {
     }
 
     if (typeof GM_addStyle === "function") {
+        // SETTINGS_PAGE_CSS (scoped from the vendored settings.css) sets its
+        // own `position: relative` on #SETTINGS_ROOT_ID -- that's the rule
+        // that used to come from the standalone extension page's <body>.
+        // Since it has the same specificity as the overlay rule below, CSS
+        // source order decides the winner: putting SETTINGS_PAGE_CSS *first*
+        // and the overlay rule *after* it means our fixed/inset positioning
+        // wins, instead of silently losing to `position: relative` and
+        // leaving the settings page laid out inline in Instagram's own
+        // document flow (which is what was causing the page-scroll mess
+        // instead of a proper overlay).
         GM_addStyle(
-            "#" + SETTINGS_ROOT_ID + " { position: fixed; inset: 0; z-index: 2147483647; overflow: auto; }\n" +
-            SETTINGS_PAGE_CSS
+            SETTINGS_PAGE_CSS + "\n" +
+            "#" + SETTINGS_ROOT_ID + " { position: fixed !important; inset: 0 !important; z-index: 2147483647; overflow: auto; }\n" +
+            // The vendored header (<header><h1>Instafn</h1></header>) has no
+            // close affordance -- it never needed one as a standalone
+            // extension page (you'd just close the tab). #instafn-settings-close
+            // is appended into that header below; this styles+positions it.
+            "#instafn-settings-close { position: absolute; top: 16px; right: 20px; width: 32px; height: 32px; border-radius: 50%; border: none; background: transparent; color: rgb(var(--ig-primary-text)); font-size: 20px; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; }\n" +
+            "#instafn-settings-close:hover { background: rgb(var(--ig-highlight-background)); }\n" +
+            "#" + SETTINGS_ROOT_ID + " header { position: relative; }"
         );
     }
 
@@ -38,6 +61,30 @@ function openSettingsPage() {
     root.id = SETTINGS_ROOT_ID;
     root.innerHTML = SETTINGS_PAGE_HTML;
     (document.body || document.documentElement).appendChild(root);
+
+    // Cross/close button -- the vendored header has none (a standalone
+    // extension page just gets closed as a tab; there's no "tab" here).
+    // Appended into <header>, which the CSS above makes a positioned
+    // ancestor so this lands top-right of it instead of the whole overlay.
+    var header = root.querySelector("header");
+    if (header && !header.querySelector("#instafn-settings-close")) {
+        var closeBtn = document.createElement("button");
+        closeBtn.id = "instafn-settings-close";
+        closeBtn.title = "Close settings";
+        closeBtn.setAttribute("aria-label", "Close settings");
+        closeBtn.textContent = "\u2715";
+        closeBtn.onclick = closeSettingsPage;
+        header.appendChild(closeBtn);
+    }
+
+    if (!__settingsEscListenerInstalled) {
+        __settingsEscListenerInstalled = true;
+        document.addEventListener("keydown", function (e) {
+            if (e.key !== "Escape") return;
+            var el = document.getElementById(SETTINGS_ROOT_ID);
+            if (el && el.style.display !== "none") closeSettingsPage();
+        });
+    }
 
     if (!__settingsPageMounted) {
         // toast.js / settings-shared.js / settings.js all run once, here --
@@ -51,26 +98,11 @@ function openSettingsPage() {
 }
 
 function initSettingsPageEntryPoints() {
+    // The only entry point now is the userscript-manager's menu command
+    // (Tampermonkey/Violentmonkey extension icon -> "Instafn settings").
+    // The on-page floating settings button was removed since that's
+    // redundant with the extension's own menu.
     if (typeof GM_registerMenuCommand === "function") {
         GM_registerMenuCommand("Instafn settings", openSettingsPage);
-    }
-
-    function addFab() {
-        if (document.getElementById("instafn-settings-fab")) return;
-        if (typeof GM_addStyle === "function" && !addFab._styled) {
-            GM_addStyle("#instafn-settings-fab { position: fixed; bottom: 20px; right: 20px; z-index: 999999; width: 44px; height: 44px; border-radius: 50%; background: #262626; color: #fff; border: none; font-size: 18px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.3); }");
-            addFab._styled = true;
-        }
-        var fab = document.createElement("button");
-        fab.id = "instafn-settings-fab";
-        fab.textContent = "\u2699";
-        fab.title = "Instafn settings";
-        fab.onclick = openSettingsPage;
-        (document.body || document.documentElement).appendChild(fab);
-    }
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", addFab, { once: true });
-    } else {
-        addFab();
     }
 }

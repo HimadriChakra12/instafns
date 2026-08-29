@@ -304,8 +304,32 @@ function toModule(key, src) {
 // against a caller-supplied `window` instead of whatever `window` means in
 // the enclosing scope. Called with unsafeWindow at dispatch time -- see
 // shim/02-page-inject.js.
+//
+// These vendored scripts patch built-ins two ways: `window.fetch = ...`
+// (goes through the `window` param above, fine) and bare `XMLHttpRequest.
+// prototype.open = ...` / `WebSocket = ...` (references the *global*
+// identifier in whatever realm this function executes in). In the upstream
+// extension that's a no-op distinction -- the vendored file is injected as
+// a real <script src=chrome-extension://...> tag, so it runs natively in
+// the page's own realm and the bare global already *is* window.
+// XMLHttpRequest. Under the userscript shim this function is called from
+// the userscript's own realm, so an unqualified `XMLHttpRequest` or
+// `WebSocket` resolves to the userscript sandbox's own constructor --
+// patching its prototype does nothing to the real page's XHR/WebSocket
+// objects Instagram's own code actually uses. That silently breaks every
+// XHR-based sniffer (voice-sniffer's DM-thread capture, graphql-sniffer,
+// storyblocking, websocket-interceptor) without throwing anything.
+// Shadowing these two identifiers with locals bound to the real window's
+// versions fixes that half of it. The other half -- Firefox's Xray
+// wrappers rejecting a sandbox-made function assigned directly onto
+// `XMLHttpRequest.prototype.open` -- needs wrapCtorForPatching() (see
+// shim/02-page-inject.js) around each one too, since a plain `window.X`
+// reference only gets you the real *object*, not an Xray-safe place to
+// assign methods onto its prototype.
 function toPageScript(key, src) {
-    return "PAGE_SCRIPTS[\"" + key + "\"] = function (window) {\n" + src + "\n};\n";
+    return "PAGE_SCRIPTS[\"" + key + "\"] = function (window) {\n" +
+        "var XMLHttpRequest = wrapCtorForPatching(window.XMLHttpRequest), WebSocket = wrapCtorForPatching(window.WebSocket);\n" +
+        src + "\n};\n";
 }
 
 // ---------------------------------------------------------------------
