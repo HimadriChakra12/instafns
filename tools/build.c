@@ -122,7 +122,7 @@ LISTOF(GRANT,
 #define BUILD_DIR   "build"
 #define MANIFEST    BUILD_DIR "/manifest.txt"
 #define BUNDLE      BUILD_DIR "/bundle.js"
-#define OUT_PATH    "dist/instafn.user.js"
+#define OUT_PATH    "dist/instafnscript.user.js"
 
 int main(int argc, char **argv) {
     const char *script_path = (argc > 1) ? argv[1] : "tools/transform.js";
