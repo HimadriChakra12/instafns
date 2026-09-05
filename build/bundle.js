@@ -13551,6 +13551,20 @@ defineModule("features/_shared/dm-message-actions.js", function (module, exports
 // A single message bubble. Old DOM fallback kept for safety.
 const MESSAGE_GROUP_SELECTOR = '[role="group"][tabindex="-1"], [role="row"]';
 
+// Bare `window` here is NOT reliably the real page window: this module runs
+// as a normal (non-toPageScript) part of the userscript bundle, and in a
+// Tampermonkey/Violentmonkey sandbox -- Firefox in particular -- unqualified
+// `window` is a sandbox wrapper, not the actual platform Window object.
+// Constructing a MouseEvent/PointerEvent with `view` set to that wrapper
+// throws ("'view' member of UIEventInit does not implement interface
+// Window") the moment Firefox's WebIDL layer checks it, which is exactly
+// what broke every synthetic hover/click dispatch in this file. __realWindow
+// is declared once in shim/02-page-inject.js and is in lexical scope here
+// since this module is concatenated into that same bundle.
+function realView() {
+  return typeof __realWindow !== "undefined" ? __realWindow : window;
+}
+
 // The quick reply/edit keyboard shortcuts must only fire when the user is
 // actually typing in a DM composer — not globally, and not just on /direct/
 // (the docked DM widget in the bottom-right corner appears on any page, and the
@@ -13602,6 +13616,17 @@ function ensureHideStyle() {
   style.id = HIDE_STYLE_ID;
   style.textContent = `[data-instafn-hiding="true"]{opacity:0 !important;visibility:hidden !important;transition:none !important;pointer-events:none !important;}`;
   document.head.appendChild(style);
+
+  // One-time sweep on first use in this page load: a guard from a previous
+  // (buggy) version of this module could have set data-instafn-hiding="true"
+  // on a still-live DOM node and never cleared it -- that attribute is state
+  // on the actual page element, so it survives a userscript update even
+  // though the *code* is now fixed, and would otherwise look exactly like
+  // the bug recurring. Only needed once per page load, right as the style
+  // (and therefore the hiding behavior) is first wired up.
+  document.querySelectorAll('[data-instafn-hiding="true"]').forEach((el) => {
+    delete el.dataset.instafnHiding;
+  });
 }
 
 function hideEl(el, hidden) {
@@ -13660,11 +13685,25 @@ function startFlashGuard() {
   });
   observer.observe(document.body, { childList: true, subtree: true });
 
-  return { observer, hidden };
+  // Absolute failsafe on top of the try/finally in reactToMessage/
+  // replyToMessage/editMessage: those guarantee stopFlashGuard() runs on
+  // every code path we know about, but "every path we know about" is
+  // exactly the kind of claim that's been wrong before in this file. If
+  // something disconnects the observer without ever calling restore() --
+  // a bug we haven't found yet, a future Instagram DOM change, anything --
+  // this guarantees the row can never stay invisible for more than 2s
+  // instead of indefinitely.
+  const failsafeTimer = setTimeout(() => {
+    observer.disconnect();
+    restore(hidden);
+  }, 2000);
+
+  return { observer, hidden, failsafeTimer };
 }
 
 function stopFlashGuard(guard, { delay = 250 } = {}) {
   if (!guard) return;
+  clearTimeout(guard.failsafeTimer);
   guard.observer?.disconnect();
   setTimeout(() => restore(guard.hidden), delay);
 }
@@ -13753,7 +13792,7 @@ function triggerHover(element) {
   ["mouseenter", "mouseover", "mousemove", "pointerenter", "pointerover"].forEach((type) => {
     const EventClass = type.startsWith("pointer") ? PointerEvent : MouseEvent;
     element.dispatchEvent(
-      new EventClass(type, { bubbles: true, cancelable: true, view: window, clientX, clientY })
+      new EventClass(type, { bubbles: true, cancelable: true, view: realView(), clientX, clientY })
     );
   });
 }
@@ -13766,7 +13805,7 @@ function triggerUnhover(group) {
   ["mouseout", "mouseleave", "pointerout", "pointerleave"].forEach((type) => {
     const EventClass = type.startsWith("pointer") ? PointerEvent : MouseEvent;
     target.dispatchEvent(
-      new EventClass(type, { bubbles: true, cancelable: true, view: window })
+      new EventClass(type, { bubbles: true, cancelable: true, view: realView() })
     );
   });
 }
@@ -13794,11 +13833,18 @@ function findClickHandler(element) {
     let hops = 0;
     while (f && hops < 6) {
       const props = f.memoizedProps || f.pendingProps;
-      if (props?.onClick) return props.onClick.bind(null);
+      // Quick-reaction chips in the dialog are plain divs (not <button>),
+      // and this style of "zero-latency" picker commonly fires on
+      // pointerdown/mousedown rather than click, so the click actually
+      // registering nothing visually was never a heart-detection problem --
+      // findClickHandler was only ever looking for onClick.
+      if (props?.onClick) return { handler: props.onClick.bind(null), type: "click" };
+      if (props?.onPointerDown) return { handler: props.onPointerDown.bind(null), type: "pointerdown" };
+      if (props?.onMouseDown) return { handler: props.onMouseDown.bind(null), type: "mousedown" };
       f = f.return;
       hops++;
     }
-    if (typeof node.onclick === "function") return node.onclick.bind(node);
+    if (typeof node.onclick === "function") return { handler: node.onclick.bind(node), type: "click" };
     node = node.parentElement;
     depth++;
   }
@@ -13807,14 +13853,15 @@ function findClickHandler(element) {
 
 /** Click a button instantly via its React handler, falling back to synthetic events. */
 function clickInstantly(button, callback) {
-  const handler = findClickHandler(button);
-  if (handler) {
+  const found = findClickHandler(button);
+  if (found) {
     try {
-      handler(
-        new MouseEvent("click", {
+      const EventClass = found.type.startsWith("pointer") ? PointerEvent : MouseEvent;
+      found.handler(
+        new EventClass(found.type, {
           bubbles: true,
           cancelable: true,
-          view: window,
+          view: realView(),
           detail: 1,
           button: 0,
         })
@@ -13829,12 +13876,17 @@ function clickInstantly(button, callback) {
   const rect = button.getBoundingClientRect();
   const clientX = rect.left + rect.width / 2;
   const clientY = rect.top + rect.height / 2;
-  ["mousedown", "mouseup", "click"].forEach((type) => {
+  // Include pointerdown/pointerup alongside mousedown/mouseup/click -- the
+  // dialog's quick-reaction chips are plain divs that fire on pointerdown
+  // for a zero-latency feel, and dispatching only mouse events never
+  // reached that handler even though the click event itself landed fine.
+  ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((type) => {
+    const EventClass = type.startsWith("pointer") ? PointerEvent : MouseEvent;
     button.dispatchEvent(
-      new MouseEvent(type, {
+      new EventClass(type, {
         bubbles: true,
         cancelable: true,
-        view: window,
+        view: realView(),
         clientX,
         clientY,
         button: 0,
@@ -13852,7 +13904,19 @@ function waitFor(getter, { maxAttempts = 20, interval = 30 } = {}) {
     let attempts = 0;
     const tick = () => {
       attempts++;
-      const found = getter();
+      // A throwing getter used to reject this promise outright, bypassing
+      // even a try/finally in the caller if it happened on the very first
+      // (synchronous) tick -- since that throw would escape before the
+      // caller's own try block is entered. Resolving to null on error keeps
+      // this a plain "not found" outcome instead of an escaping exception,
+      // so callers' cleanup always runs.
+      let found;
+      try {
+        found = getter();
+      } catch (err) {
+        console.error("[Instafn] waitFor getter threw:", err);
+        return resolve(null);
+      }
       if (found) return resolve(found);
       if (attempts >= maxAttempts) return resolve(null);
       setTimeout(tick, interval);
@@ -13876,91 +13940,121 @@ function buttonFrom(svgSelector, scope) {
 /** Double-tap to like: react to `group` with the heart (first reaction). */
 async function reactToMessage(group) {
   const guard = startFlashGuard();
-  triggerHover(getHoverTarget(group));
+  // The whole pipeline used to unhide (stopFlashGuard) only at each explicit
+  // return point. That's exactly the kind of thing that's fragile against
+  // Instagram DOM changes: if any step here throws instead of cleanly
+  // returning null/false (e.g. a selector match that no longer holds), the
+  // function aborts mid-pipeline and NEVER reaches triggerUnhover/
+  // stopFlashGuard -- leaving the hover row's react/reply/more icons stuck
+  // at opacity:0 (which is what the flash guard's hide style enforces)
+  // permanently, since nothing else ever clears that dataset attribute.
+  // try/finally guarantees cleanup runs on every exit path, including a
+  // thrown error, so a failed react at worst does nothing instead of
+  // wedging the row.
+  try {
+    triggerHover(getHoverTarget(group));
 
-  const reactBtn = await waitFor(() => buttonFrom(REACT_SVG, group));
-  if (!reactBtn) {
+    const reactBtn = await waitFor(() => buttonFrom(REACT_SVG, group));
+    if (!reactBtn) return false;
+    clickInstantly(reactBtn);
+
+    const heart = await waitFor(() => {
+      const dialog = document.querySelector('[role="dialog"]');
+      if (!dialog) return null;
+      const buttons = Array.from(dialog.querySelectorAll('[role="button"]'));
+      // Prefer the literal heart. Instagram doesn't always render reaction
+      // emoji as plain unicode text -- it's also seen rendering them as an
+      // <img> sprite (alt="❤️" / aria-label mentioning "heart") for consistent
+      // cross-platform glyphs, which leaves textContent empty and breaks both
+      // this match and the length<=2 fallback below (an empty string fails
+      // the `text &&` guard, and no button textContent-includes-❤ anywhere).
+      const explicit = buttons.find(
+        (b) =>
+          (b.textContent || "").includes("❤") ||
+          /heart/i.test(b.getAttribute("aria-label") || "") ||
+          [...b.querySelectorAll("img")].some((img) =>
+            (img.getAttribute("alt") || "").includes("❤")
+          )
+      );
+      if (explicit) return explicit;
+      return buttons.find((b) => {
+        if (b.querySelector('svg[aria-label="Choose an emoji"]')) return false;
+        const text = b.querySelector("span")?.textContent?.trim() || "";
+        return text && [...text].length <= 2;
+      });
+    });
+
+    if (heart) clickInstantly(heart);
+    return !!heart;
+  } catch (err) {
+    console.error("[Instafn] reactToMessage failed:", err);
+    return false;
+  } finally {
     triggerUnhover(group);
     stopFlashGuard(guard);
-    return false;
   }
-  clickInstantly(reactBtn);
-
-  const heart = await waitFor(() => {
-    const dialog = document.querySelector('[role="dialog"]');
-    if (!dialog) return null;
-    const buttons = Array.from(dialog.querySelectorAll('[role="button"]'));
-    // Prefer the literal heart; fall back to the first emoji button.
-    const explicit = buttons.find((b) => (b.textContent || "").includes("❤"));
-    if (explicit) return explicit;
-    return buttons.find((b) => {
-      if (b.querySelector('svg[aria-label="Choose an emoji"]')) return false;
-      const text = b.querySelector("span")?.textContent?.trim() || "";
-      return text && [...text].length <= 2;
-    });
-  });
-
-  if (heart) clickInstantly(heart);
-  triggerUnhover(group);
-  stopFlashGuard(guard);
-  return !!heart;
 }
 
 /** Quick reply: open the reply composer for `group` (single click, no submenu). */
 async function replyToMessage(group) {
   const guard = startFlashGuard();
-  triggerHover(getHoverTarget(group));
-
-  const replyBtn = await waitFor(() => buttonFrom(REPLY_SVG, group));
-  if (replyBtn) clickInstantly(replyBtn);
-  triggerUnhover(group);
-  stopFlashGuard(guard);
-  return !!replyBtn;
+  try {
+    triggerHover(getHoverTarget(group));
+    const replyBtn = await waitFor(() => buttonFrom(REPLY_SVG, group));
+    if (replyBtn) clickInstantly(replyBtn);
+    return !!replyBtn;
+  } catch (err) {
+    console.error("[Instafn] replyToMessage failed:", err);
+    return false;
+  } finally {
+    triggerUnhover(group);
+    stopFlashGuard(guard);
+  }
 }
 
 /** Quick edit: open the "See more options" menu for `group` and click Edit. */
 async function editMessage(group) {
   const guard = startFlashGuard();
-  triggerHover(getHoverTarget(group));
+  try {
+    triggerHover(getHoverTarget(group));
 
-  const moreBtn = await waitFor(
-    () =>
-      buttonFrom(MORE_SVG, group) ||
-      group.querySelector('[role="button"][aria-haspopup="menu"]')
-  );
-  if (!moreBtn) {
+    const moreBtn = await waitFor(
+      () =>
+        buttonFrom(MORE_SVG, group) ||
+        group.querySelector('[role="button"][aria-haspopup="menu"]')
+    );
+    if (!moreBtn) return false;
+    clickInstantly(moreBtn);
+
+    const editBtn = await waitFor(() => {
+      const dialog = document.querySelector('[role="dialog"]');
+      if (!dialog) return null;
+      return (
+        dialog.querySelector('svg[aria-label="Edit"]')?.closest('[role="button"]') ||
+        Array.from(dialog.querySelectorAll('[role="button"]')).find(
+          (b) => b.textContent?.trim() === "Edit"
+        ) ||
+        null
+      );
+    });
+
+    if (editBtn) {
+      clickInstantly(editBtn);
+      return true;
+    }
+
+    // Couldn't find Edit — close the menu so we don't leave it dangling.
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true })
+    );
+    return false;
+  } catch (err) {
+    console.error("[Instafn] editMessage failed:", err);
+    return false;
+  } finally {
     triggerUnhover(group);
     stopFlashGuard(guard);
-    return false;
   }
-  clickInstantly(moreBtn);
-
-  const editBtn = await waitFor(() => {
-    const dialog = document.querySelector('[role="dialog"]');
-    if (!dialog) return null;
-    return (
-      dialog.querySelector('svg[aria-label="Edit"]')?.closest('[role="button"]') ||
-      Array.from(dialog.querySelectorAll('[role="button"]')).find(
-        (b) => b.textContent?.trim() === "Edit"
-      ) ||
-      null
-    );
-  });
-
-  triggerUnhover(group);
-
-  if (editBtn) {
-    clickInstantly(editBtn);
-    stopFlashGuard(guard);
-    return true;
-  }
-
-  // Couldn't find Edit — close the menu so we don't leave it dangling.
-  document.dispatchEvent(
-    new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true })
-  );
-  stopFlashGuard(guard);
-  return false;
 }
 
 
@@ -18524,6 +18618,16 @@ defineModule("utils/eventInterceptor.js", function (module, exports, require) {
  * Provides common patterns for intercepting user actions
  */
 
+// Bare `window` is not reliably the real page window inside a userscript
+// sandbox (Firefox in particular gives unqualified `window` a wrapper that
+// fails the strict WebIDL check MouseEvent/PointerEvent's `view` field
+// requires -- "'view' member of UIEventInit does not implement interface
+// Window"). __realWindow is declared once in shim/02-page-inject.js and is
+// in lexical scope here since this module is concatenated into that bundle.
+function realView() {
+  return typeof __realWindow !== "undefined" ? __realWindow : window;
+}
+
 /**
  * Stop event propagation and prevent default
  */
@@ -18536,12 +18640,14 @@ function stopEvent(e) {
 /**
  * Full click event configuration
  */
-const FULL_CLICK_INIT = {
-  bubbles: true,
-  cancelable: true,
-  composed: true,
-  view: window,
-};
+function fullClickInit() {
+  return {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: realView(),
+  };
+}
 
 /**
  * Dispatch a full click sequence (pointerdown, mousedown, mouseup, click)
@@ -18549,14 +18655,15 @@ const FULL_CLICK_INIT = {
 function dispatchFullClick(target) {
   if (!target) return;
 
+  const init = fullClickInit();
   const events = [
     new PointerEvent("pointerdown", {
-      ...FULL_CLICK_INIT,
+      ...init,
       pointerType: "mouse",
     }),
-    new MouseEvent("mousedown", FULL_CLICK_INIT),
-    new MouseEvent("mouseup", FULL_CLICK_INIT),
-    new MouseEvent("click", FULL_CLICK_INIT),
+    new MouseEvent("mousedown", init),
+    new MouseEvent("mouseup", init),
+    new MouseEvent("click", init),
   ];
 
   events.forEach((evt) => {
@@ -18577,7 +18684,7 @@ function dispatchMouseClick(target) {
   const evt = new MouseEvent("click", {
     bubbles: true,
     cancelable: true,
-    view: window,
+    view: realView(),
   });
   target.dispatchEvent(evt);
 }
