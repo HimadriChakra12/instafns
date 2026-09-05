@@ -3,6 +3,16 @@
  * Provides common patterns for intercepting user actions
  */
 
+// Bare `window` is not reliably the real page window inside a userscript
+// sandbox (Firefox in particular gives unqualified `window` a wrapper that
+// fails the strict WebIDL check MouseEvent/PointerEvent's `view` field
+// requires -- "'view' member of UIEventInit does not implement interface
+// Window"). __realWindow is declared once in shim/02-page-inject.js and is
+// in lexical scope here since this module is concatenated into that bundle.
+function realView() {
+  return typeof __realWindow !== "undefined" ? __realWindow : window;
+}
+
 /**
  * Stop event propagation and prevent default
  */
@@ -15,12 +25,14 @@ export function stopEvent(e) {
 /**
  * Full click event configuration
  */
-const FULL_CLICK_INIT = {
-  bubbles: true,
-  cancelable: true,
-  composed: true,
-  view: window,
-};
+function fullClickInit() {
+  return {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: realView(),
+  };
+}
 
 /**
  * Dispatch a full click sequence (pointerdown, mousedown, mouseup, click)
@@ -28,14 +40,15 @@ const FULL_CLICK_INIT = {
 export function dispatchFullClick(target) {
   if (!target) return;
 
+  const init = fullClickInit();
   const events = [
     new PointerEvent("pointerdown", {
-      ...FULL_CLICK_INIT,
+      ...init,
       pointerType: "mouse",
     }),
-    new MouseEvent("mousedown", FULL_CLICK_INIT),
-    new MouseEvent("mouseup", FULL_CLICK_INIT),
-    new MouseEvent("click", FULL_CLICK_INIT),
+    new MouseEvent("mousedown", init),
+    new MouseEvent("mouseup", init),
+    new MouseEvent("click", init),
   ];
 
   events.forEach((evt) => {
@@ -56,7 +69,7 @@ export function dispatchMouseClick(target) {
   const evt = new MouseEvent("click", {
     bubbles: true,
     cancelable: true,
-    view: window,
+    view: realView(),
   });
   target.dispatchEvent(evt);
 }
